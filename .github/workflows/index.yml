@@ -1,0 +1,83 @@
+# Runs the Asentify market-data indexer every 10 minutes on GitHub's free runners (public repository: no minute limit).
+# It reads finalized events of the Asentify marketplace and collection from the Asentum TESTNET, keeps its SQLite
+# database on the `data` branch, and publishes one snapshot per collection there. No secrets are needed: every value
+# below is public (the same values the website serves at /api/market/config).
+#
+# The `data` branch is replaced on every run (one commit, force-pushed), so the repository does not grow over time.
+# If that branch is ever lost, the next run rebuilds everything from MARKET_START_BLOCK (about 45 minutes).
+name: index
+
+on:
+  schedule:
+    - cron: "4-59/10 * * * *"     # every 10 minutes, off the busy :00 mark; GitHub may delay scheduled runs
+  workflow_dispatch: {}            # "Run workflow" button in the Actions tab
+
+permissions:
+  contents: write                  # only to push the `data` branch of this repository
+
+concurrency:
+  group: indexer                   # never two runs at once (they would race on the database)
+  cancel-in-progress: false
+
+jobs:
+  index:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      ASENTUM_RPC: https://testnet.asentum.com
+      MARKET: "0xbb35f3e0dc49d568456b4e7a81fb25c6985af751"
+      MARKET_START_BLOCK: "930000"
+      COLLECTIONS: "0x35162eafe0f1260c6a9a57291f5bdd79179cef82:930000:complete"
+      SOURCE: logs                 # eth_getLogs in ≤500-block ranges; a range that keeps failing is read from receipts
+      ONCE: "1"
+      DB_PATH: work/data/indexer.sqlite
+      OUT_DIR: work/api/market
+    steps:
+      - name: Check out the indexer
+        uses: actions/checkout@v4
+
+      - name: Restore the database and snapshots (data branch)
+        id: restore
+        continue-on-error: true    # first run: the branch doesn't exist yet
+        uses: actions/checkout@v4
+        with:
+          ref: data
+          path: work
+
+      - name: Set up Node.js 22 (built-in SQLite)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Run one indexer cycle
+        run: |
+          mkdir -p work/data work/api/market
+          node --no-warnings indexer/asentify-indexer.mjs
+
+      - name: Write the public config (same shape as the website's /api/market/config)
+        run: |
+          node -e '
+            const fs = require("fs");
+            const cols = process.env.COLLECTIONS.split(",").map((c) => c.split(":")[0].toLowerCase());
+            const cfg = { market: process.env.MARKET.toLowerCase(), collections: cols, startBlock: Number(process.env.MARKET_START_BLOCK), complete: process.env.COLLECTIONS.includes(":complete") };
+            fs.writeFileSync("work/api/market/config", JSON.stringify(cfg));
+            const snaps = cols.map((c) => { try { return JSON.parse(fs.readFileSync("work/api/market/" + c + ".json", "utf8")); } catch { return null; } });
+            // the website asks for /api/market/<collection> (no extension): publish both names
+            cols.forEach((c, i) => { if (snaps[i]) fs.writeFileSync("work/api/market/" + c, JSON.stringify(snaps[i])); });
+            const status = { updatedAt: new Date().toISOString(), run: process.env.GITHUB_RUN_ID,
+              collections: cols.map((c, i) => ({ collection: c, indexedTo: snaps[i]?.meta?.indexedTo ?? null, lastError: snaps[i] ? snaps[i].meta.lastError : "no snapshot" })) };
+            fs.writeFileSync("work/status.json", JSON.stringify(status, null, 2));
+            console.log(JSON.stringify(status));
+          '
+
+      - name: Publish (replace the data branch with one new commit)
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd work
+          rm -rf .git
+          git init -q -b data
+          git add -A
+          git -c user.name="asentify-indexer" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -q -m "data: $(node -p 'require("./status.json").collections.map(c=>c.indexedTo).join(",")') ($(date -u +%FT%TZ))"
+          git push -q -f "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" data
