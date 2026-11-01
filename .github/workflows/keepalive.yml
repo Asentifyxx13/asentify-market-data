@@ -1,7 +1,7 @@
 # Keeps the scheduled indexer running indefinitely.
 # GitHub disables scheduled workflows after 60 days without repository activity. Calling the "enable workflow" API
 # resets that timer (the method used by gautamkrishnar/keepalive-workflow v2 and liskin/gh-workflow-keepalive),
-# without dummy commits. Runs weekly and re-enables both workflows, including itself.
+# without dummy commits. Runs weekly and re-enables all scheduled workflows, including itself.
 name: keepalive
 
 on:
@@ -21,7 +21,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          for wf in index.yml keepalive.yml; do
+          for wf in index.yml backup.yml keepalive.yml; do
             gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/enable"
             echo "re-enabled ${wf}"
           done

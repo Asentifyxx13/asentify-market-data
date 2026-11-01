@@ -1,0 +1,77 @@
+# Weekly backup of the indexer database to the `backup` branch.
+#
+# Why: the public Asentum gateway does not serve the whole chain (it starts at block 865,584), so blocks it stops
+# serving could never be re-read. And the `data` branch keeps only its latest state. This branch keeps the last
+# 12 weekly copies (about three months), so there is always a known-good database to go back to.
+#
+# A copy is written only if the database passes SQLite's integrity check and has not gone backwards
+# (fewer events or a lower indexed block than the newest backup). Otherwise the run fails, GitHub e-mails the
+# owner, and the existing backups stay untouched. The index workflow restores from here automatically if the
+# `data` branch is ever missing.
+name: backup
+
+on:
+  schedule:
+    - cron: "41 2 * * 0"           # every Sunday 02:41 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write                  # only to push the `backup` branch of this repository
+
+concurrency:
+  group: indexer                   # same group as the indexer: never copy the database while a run is writing it
+  cancel-in-progress: false
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the scripts
+        uses: actions/checkout@v4
+
+      - name: Check out the current database (data branch)
+        uses: actions/checkout@v4
+        with:
+          ref: data
+          path: work
+
+      - name: Check out the existing backups
+        continue-on-error: true    # first run: the branch doesn't exist yet
+        uses: actions/checkout@v4
+        with:
+          ref: backup
+          path: bk
+
+      - name: Set up Node.js 22 (built-in SQLite)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Verify and copy the database
+        run: |
+          mkdir -p bk/backups
+          node --no-warnings indexer/backup.mjs work/data/indexer.sqlite bk/backups
+
+      - name: Publish (replace the backup branch with one new commit)
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd bk
+          rm -rf .git
+          cat > README.md <<'EOF'
+          # Asentify indexer backups
+
+          Weekly copies of the indexer database (`backups/indexer-YYYY-MM-DD.sqlite`, newest 12 kept).
+          `backups/latest.json` describes the newest one. Each copy passed SQLite's integrity check and
+          had at least as many events and as high an indexed block as the previous copy.
+
+          The `index` workflow restores the newest copy automatically if the `data` branch is missing.
+          To restore an older copy by hand: put it at `data/indexer.sqlite` on the `data` branch.
+          EOF
+          sed -i 's/^          //' README.md
+          git init -q -b backup
+          git add -A
+          git -c user.name="asentify-indexer" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -q -m "backup: $(node -p 'const l=require("./backups/latest.json"); l.file+" ("+l.events+" events, block "+l.indexedTo+")"')"
+          git push -q -f "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" backup

@@ -26,16 +26,27 @@ on chain (`ownerOf`), and publishes the result on the **`data`** branch:
 Read it at `https://raw.githubusercontent.com/Asentifyxx13/asentify-market-data/data/<file>` (CORS open, cached ~5 minutes).
 
 The `data` branch is replaced by a single new commit on every run, so the repository does not grow.
-If it is deleted, the next run rebuilds everything from block 930,000 (about 45 minutes).
+
+**Weekly backup:** `.github/workflows/backup.yml` copies the database to the **`backup`** branch every Sunday
+(`backups/indexer-YYYY-MM-DD.sqlite`, newest 12 kept) through `indexer/backup.mjs`. A copy is made only if the
+database passes SQLite's integrity check and has not gone backwards (fewer events or a lower indexed block than the
+newest backup); otherwise the run fails, GitHub e-mails the owner, and the existing backups stay as they are. This
+matters because the public gateway does not serve the whole chain (it starts at block 865,584), so blocks it stops
+serving could not be read again.
+
+If the `data` branch is deleted, the next run restores the newest backup and continues from its checkpoint.
+With no backup either, it rebuilds everything from block 930,000.
 
 ## Operating it
 
 - **Run now:** Actions tab → *index* → *Run workflow*.
 - **Runs indefinitely:** GitHub disables scheduled workflows after 60 days without repository activity.
-  `.github/workflows/keepalive.yml` re-enables both workflows every Monday through the GitHub API, which resets that
+  `.github/workflows/keepalive.yml` re-enables all three scheduled workflows every Monday through the GitHub API, which resets that
   timer (no dummy commits). If it ever stops anyway, re-enable *index* in the Actions tab; the website shows
   *Out of date* about 30 minutes after the data stops updating.
-- **Start over:** delete the `data` branch, then *Run workflow*.
+- **Back up now:** Actions tab → *backup* → *Run workflow*.
+- **Go back to an older backup:** put that `backups/indexer-….sqlite` at `data/indexer.sqlite` on the `data` branch.
+- **Start over from scratch:** delete both the `data` and `backup` branches, then *Run workflow* on *index*.
 - **Change addresses or start block:** edit the `env:` block in `.github/workflows/index.yml`.
 
 ## Source

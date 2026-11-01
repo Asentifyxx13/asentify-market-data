@@ -4,7 +4,8 @@
 # below is public (the same values the website serves at /api/market/config).
 #
 # The `data` branch is replaced on every run (one commit, force-pushed), so the repository does not grow over time.
-# If that branch is ever lost, the next run rebuilds everything from MARKET_START_BLOCK (about 45 minutes).
+# If that branch is ever lost, the next run restores the newest weekly copy from the `backup` branch (backup.yml)
+# and continues from there; with no backup either, it rebuilds everything from MARKET_START_BLOCK.
 name: index
 
 on:
@@ -43,6 +44,23 @@ jobs:
         with:
           ref: data
           path: work
+
+      - name: If the data branch is missing, fetch the newest weekly backup
+        id: fallback
+        if: steps.restore.outcome != 'success'
+        continue-on-error: true    # no backup yet either: the run rebuilds from MARKET_START_BLOCK
+        uses: actions/checkout@v4
+        with:
+          ref: backup
+          path: bk
+
+      - name: Restore the database from that backup
+        if: steps.fallback.outcome == 'success'
+        run: |
+          rm -rf work && mkdir -p work/data
+          f="bk/backups/$(node -p 'require("./bk/backups/latest.json").file')"
+          cp "$f" work/data/indexer.sqlite
+          echo "restored $f; the indexer continues from its checkpoint"
 
       - name: Set up Node.js 22 (built-in SQLite)
         uses: actions/setup-node@v4
