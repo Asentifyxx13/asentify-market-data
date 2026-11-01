@@ -31,8 +31,10 @@ If it is deleted, the next run rebuilds everything from block 930,000 (about 45 
 ## Operating it
 
 - **Run now:** Actions tab → *index* → *Run workflow*.
-- **Stopped running?** GitHub disables scheduled workflows after 60 days without repository activity. Re-enable it
-  in the Actions tab (*Enable workflow*). The website shows *Out of date* when the data stops updating.
+- **Runs indefinitely:** GitHub disables scheduled workflows after 60 days without repository activity.
+  `.github/workflows/keepalive.yml` re-enables both workflows every Monday through the GitHub API, which resets that
+  timer (no dummy commits). If it ever stops anyway, re-enable *index* in the Actions tab; the website shows
+  *Out of date* about 30 minutes after the data stops updating.
 - **Start over:** delete the `data` branch, then *Run workflow*.
 - **Change addresses or start block:** edit the `env:` block in `.github/workflows/index.yml`.
 
