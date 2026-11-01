@@ -1,4 +1,4 @@
-// Asentify market-data indexer (bundled). Source: Asentifyxx13/asentify- (private), branch indexer/receipts-source, commit c114e64. Reads the Asentum testnet only; sends no transactions; needs no keys.
+// Asentify market-data indexer (bundled). Source: Asentifyxx13/asentify- (private), branch public-create, commit 0e5428d. Reads the Asentum testnet only; sends no transactions; needs no keys.
 
 // indexer/worker.ts
 import { mkdirSync, renameSync, writeFileSync } from "node:fs";
@@ -412,7 +412,11 @@ function dailySeries(sales, nowMs, days) {
 
 // src/lib/indexer/snapshot.ts
 var SNAPSHOT_VERSION = 1;
-var STALE_AFTER_MS = 5 * 6e4;
+function staleAfterMs(raw) {
+  const n = Number((raw ?? "").trim());
+  return Number.isFinite(n) && n >= 1 && n <= 240 ? Math.round(n * 6e4) : 5 * 6e4;
+}
+var STALE_AFTER_MS = staleAfterMs(typeof process !== "undefined" ? process.env.NEXT_PUBLIC_MARKET_STALE_MINUTES : void 0);
 var s = (v) => v === null ? null : v.toString();
 function buildSnapshot(input, lastError = null) {
   const st = collectionStats(input);
@@ -958,6 +962,35 @@ async function verifyOwners(rpc, store, market, collection, collections, atBlock
   if (tokens.length) opts.log?.(`owners: checked ${rows.length}/${tokens.length} tokens of ${collection.slice(0, 10)}\u2026 on chain${unknown ? ` (${unknown} unreadable, kept previous)` : ""}`);
   return { checked: rows.length, unknown };
 }
+var DISCOVER_LOOKBACK = 4e4;
+var DISCOVER_MAX = 50;
+var MARKET_KINDS = /* @__PURE__ */ new Set(["Listed", "Sold", "OfferMade", "OfferAccepted", "ListingCancelled"]);
+var HEX40 = /^0x[0-9a-f]{40}$/;
+function discoverCollections(store, market, known, marketStart, opts = {}) {
+  const lookback = opts.lookback ?? DISCOVER_LOOKBACK, max = opts.max ?? DISCOVER_MAX;
+  let all = [];
+  try {
+    const v = JSON.parse(store.getKV("discovered") || "[]");
+    if (Array.isArray(v)) all = v.filter((d) => d && HEX40.test(d.address) && Number.isInteger(d.start) && Number.isInteger(d.firstSeen));
+  } catch {
+    all = [];
+  }
+  const have = /* @__PURE__ */ new Set([...known, ...all.map((d) => d.address), market]);
+  const added = [];
+  for (const e of store.events([market])) {
+    if (all.length + added.length >= max) break;
+    if (!MARKET_KINDS.has(e.name)) continue;
+    const c = typeof e.data.collection === "string" ? e.data.collection.toLowerCase() : "";
+    if (!HEX40.test(c) || have.has(c)) continue;
+    have.add(c);
+    added.push({ address: c, firstSeen: e.block, start: Math.max(marketStart, e.block - lookback) });
+  }
+  if (added.length) {
+    all = [...all, ...added];
+    store.setKV("discovered", JSON.stringify(all));
+  }
+  return { all, added };
+}
 function parseSource(v) {
   const s2 = (v || "logs").trim().toLowerCase();
   if (s2 === "logs" || s2 === "receipts" || s2 === "legacy") return s2;
@@ -981,8 +1014,12 @@ async function runCycle(rpc, store, cfg, now = Date.now) {
   const market = toHexAddress(cfg.market);
   store.watch(market, cfg.marketStart);
   for (const c of cfg.collections) store.watch(c.address, c.start);
+  const dOpts = typeof cfg.discover === "object" ? cfg.discover : {};
+  const listed = new Set(cfg.collections.map((c) => c.address));
+  const known = () => cfg.discover ? discoverCollections(store, market, listed, cfg.marketStart, dOpts) : { all: [], added: [] };
+  for (const d of known().all) store.watch(d.address, d.start);
   let lastError = null, result = null;
-  try {
+  const sync = async () => {
     const source = cfg.source || "legacy";
     if (source === "receipts") {
       if (!isBlockSource(rpc)) throw new Error("SOURCE=receipts needs an RPC client that can read blocks and receipts");
@@ -994,14 +1031,28 @@ async function runCycle(rpc, store, cfg, now = Date.now) {
     } else {
       result = await syncOnce(rpc, store, { now });
     }
+  };
+  let discovered = [];
+  try {
+    await sync();
+    const k = known();
+    discovered = k.all;
+    if (k.added.length) {
+      for (const d of k.added) {
+        store.watch(d.address, d.start);
+        console.log((/* @__PURE__ */ new Date()).toISOString(), `discovered collection ${d.address} (first marketplace event at block ${d.firstSeen}); reading from block ${d.start}`);
+      }
+      await sync();
+    }
   } catch (e) {
     lastError = e instanceof Error ? e.message : String(e);
   }
-  const collections = new Set(cfg.collections.map((c) => c.address));
+  const all = [...cfg.collections, ...discovered.filter((d) => !listed.has(d.address)).map((d) => ({ address: d.address, start: d.start, complete: false }))];
+  const collections = new Set(all.map((c) => c.address));
   const log = (m) => console.log((/* @__PURE__ */ new Date()).toISOString(), m);
   if (!lastError && cfg.verifyOwners !== false && canReadOwners(rpc)) {
     const at = store.meta().finalizedSeen ?? 0;
-    for (const c of cfg.collections) {
+    for (const c of all) {
       try {
         await verifyOwners(rpc, store, market, c.address, collections, at, { log });
       } catch (e) {
@@ -1011,7 +1062,8 @@ async function runCycle(rpc, store, cfg, now = Date.now) {
   }
   mkdirSync(cfg.outDir, { recursive: true });
   const cps = store.checkpoints(), meta = store.meta();
-  for (const c of cfg.collections) {
+  for (const c of all) {
+    if (!cps[c.address]) continue;
     const attributed = attributeEvents(store.events([market, c.address]), market, collections);
     const { fixes, mismatches } = corrections(attributed, c.address, store.verifiedOwners(c.address), cps[c.address].indexedTo);
     for (const m of mismatches) log(`owners: ${c.address.slice(0, 10)}\u2026 ${m} (chain value used)`);
@@ -1029,6 +1081,10 @@ async function runCycle(rpc, store, cfg, now = Date.now) {
     if (fixes.length) snap.activity = snap.activity.filter((a) => a.txHash !== SYNTHETIC_TX);
     writeAtomic(join(cfg.outDir, c.address + ".json"), JSON.stringify(snap));
   }
+  writeAtomic(join(cfg.outDir, "collections.json"), JSON.stringify({
+    verified: cfg.collections.map((c) => c.address),
+    discovered: discovered.filter((d) => !listed.has(d.address)).map((d) => ({ address: d.address, firstSeen: d.firstSeen }))
+  }));
   if (lastError) throw new Error(lastError);
   return result;
 }
@@ -1048,7 +1104,8 @@ async function main() {
     dbPath: process.env.DB_PATH || "./data/indexer.sqlite",
     outDir: process.env.OUT_DIR || "./data/market",
     source: parseSource(process.env.SOURCE),
-    maxBlocks: Number(process.env.MAX_BLOCKS) || void 0
+    maxBlocks: Number(process.env.MAX_BLOCKS) || void 0,
+    discover: (process.env.DISCOVER || "").trim().toLowerCase() === "on"
   };
   mkdirSync(join(cfg.dbPath, ".."), { recursive: true });
   const store = new SqliteStore(cfg.dbPath);
@@ -1081,6 +1138,9 @@ async function main() {
 }
 if (process.argv[1] && /(^|[\\/])(worker\.ts|asentify-indexer\.mjs)$/.test(process.argv[1])) main();
 export {
+  DISCOVER_LOOKBACK,
+  DISCOVER_MAX,
+  discoverCollections,
   parseCollections,
   parseSource,
   runCycle,

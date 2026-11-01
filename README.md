@@ -19,8 +19,9 @@ on chain (`ownerOf`), and publishes the result on the **`data`** branch:
 | File (branch `data`) | Content |
 |---|---|
 | `api/market/<collection>` and `api/market/<collection>.json` | Snapshot: floor, offers, sales, owners, supply, activity, with status labels |
-| `api/market/config` | `{market, collections, startBlock, complete}` (same shape as the website's `/api/market/config`) |
+| `api/market/config` | `{market, collections, startBlock, complete, discovered}`; `discovered` = collections people created, found through the marketplace (shown as Unverified on the site) |
 | `status.json` | Last run time, indexed block and last error per collection |
+| `api/market/collections.json` | `{verified, discovered}`: the listed collections and the ones people created, found through the marketplace |
 | `data/indexer.sqlite` | The indexer's database (events, checkpoints, verified owners) |
 
 Read it at `https://raw.githubusercontent.com/Asentifyxx13/asentify-market-data/data/<file>` (CORS open, cached ~5 minutes).

@@ -30,6 +30,7 @@ jobs:
       MARKET_START_BLOCK: "930000"
       COLLECTIONS: "0x35162eafe0f1260c6a9a57291f5bdd79179cef82:930000:complete"
       SOURCE: logs                 # eth_getLogs in ≤500-block ranges; a range that keeps failing is read from receipts
+      DISCOVER: "on"               # also index collections people create, found through the marketplace's events (published as "discovered")
       ONCE: "1"
       DB_PATH: work/data/indexer.sqlite
       OUT_DIR: work/api/market
@@ -77,13 +78,19 @@ jobs:
           node -e '
             const fs = require("fs");
             const cols = process.env.COLLECTIONS.split(",").map((c) => c.split(":")[0].toLowerCase());
-            const cfg = { market: process.env.MARKET.toLowerCase(), collections: cols, startBlock: Number(process.env.MARKET_START_BLOCK), complete: process.env.COLLECTIONS.includes(":complete") };
+            // collections people created, found by the indexer through the marketplace ("Unverified" on the site)
+            let found = [];
+            try { found = JSON.parse(fs.readFileSync("work/api/market/collections.json", "utf8")).discovered || []; } catch {}
+            found = found.filter((d) => /^0x[0-9a-f]{40}$/.test(d.address) && !cols.includes(d.address)).slice(0, 50);
+            const cfg = { market: process.env.MARKET.toLowerCase(), collections: cols, startBlock: Number(process.env.MARKET_START_BLOCK), complete: process.env.COLLECTIONS.includes(":complete"), discovered: found };
             fs.writeFileSync("work/api/market/config", JSON.stringify(cfg));
             const snaps = cols.map((c) => { try { return JSON.parse(fs.readFileSync("work/api/market/" + c + ".json", "utf8")); } catch { return null; } });
-            // the website asks for /api/market/<collection> (no extension): publish both names
-            cols.forEach((c, i) => { if (snaps[i]) fs.writeFileSync("work/api/market/" + c, JSON.stringify(snaps[i])); });
+            // the website asks for /api/market/<collection> (no extension): publish both names, for every collection
+            for (const c of [...cols, ...found.map((d) => d.address)]) {
+              try { fs.writeFileSync("work/api/market/" + c, fs.readFileSync("work/api/market/" + c + ".json", "utf8")); } catch {}
+            }
             const status = { updatedAt: new Date().toISOString(), run: process.env.GITHUB_RUN_ID,
-              collections: cols.map((c, i) => ({ collection: c, indexedTo: snaps[i]?.meta?.indexedTo ?? null, lastError: snaps[i] ? snaps[i].meta.lastError : "no snapshot" })) };
+              collections: cols.map((c, i) => ({ collection: c, indexedTo: snaps[i]?.meta?.indexedTo ?? null, lastError: snaps[i] ? snaps[i].meta.lastError : "no snapshot" })), discovered: found.length };
             fs.writeFileSync("work/status.json", JSON.stringify(status, null, 2));
             console.log(JSON.stringify(status));
           '
