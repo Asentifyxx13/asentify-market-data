@@ -1,4 +1,4 @@
-// Asentify market-data indexer (bundled). Source: Asentifyxx13/asentify- (private), branch main, commit b3c4f1c. Reads the Asentum testnet only; sends no transactions; needs no keys.
+// Asentify market-data indexer (bundled). Source: Asentifyxx13/asentify- (private), branch catalog-metadata, commit 04e753d. Reads the Asentum testnet only; sends no transactions; needs no keys.
 
 // indexer/worker.ts
 import { mkdirSync, renameSync, writeFileSync } from "node:fs";
@@ -937,7 +937,11 @@ function tokensToVerify(events, collection, verified, rotateFrom, opts = {}) {
 // indexer/catalog.ts
 var PER_COLLECTION = 24;
 var TOTAL_TOKENS = 96;
-var GATEWAYS = ["https://ipfs.io/ipfs", "https://dweb.link/ipfs", "https://cloudflare-ipfs.com/ipfs"];
+var GATEWAYS = ["https://ipfs.io/ipfs", "https://dweb.link/ipfs", "https://w3s.link/ipfs", "https://gateway.pinata.cloud/ipfs"];
+function gatewaysFrom(raw) {
+  const l = (raw || "").split(",").map((x) => x.trim().replace(/\/+$/, "")).filter((x) => /^https:\/\/[^\s"'<>]{1,200}$/.test(x));
+  return l.length ? l.slice(0, 6) : GATEWAYS;
+}
 var IPFS = /^ipfs:\/\/([A-Za-z0-9]{20,100}(?:\/[A-Za-z0-9._\-\/]{0,200})?)$/;
 var HTTPS = /^https:\/\/[^\s"'<>]{1,400}$/;
 var HEX = /^0x[0-9a-f]{40}$/;
@@ -971,14 +975,19 @@ function pickIds(listed, supply, cap = PER_COLLECTION) {
   }
   return { ids, more: supply > ids.length };
 }
-async function fetchThrough(uri, fetchText, gateways = GATEWAYS, timeoutMs = 8e3) {
+async function fetchThrough(uri, fetchText, gateways = GATEWAYS, timeoutMs = 1e4) {
   const m = IPFS.exec(uri);
   const urls = m ? gateways.map((g2) => `${g2}/${m[1]}`) : HTTPS.test(uri) ? [uri] : [];
-  for (const u of urls) {
-    const t = await fetchText(u, timeoutMs).catch(() => null);
-    if (t) return t;
-  }
-  return null;
+  if (!urls.length) return null;
+  return new Promise((resolve) => {
+    let left = urls.length;
+    for (const u of urls) {
+      fetchText(u, timeoutMs).catch(() => null).then((t) => {
+        if (t) resolve(t);
+        else if (--left === 0) resolve(null);
+      });
+    }
+  });
 }
 function parseJson(t) {
   if (!t || t.length > 2e5) return null;
@@ -1016,6 +1025,7 @@ async function buildCatalog(o) {
   const now = o.now ?? Date.now, started = now(), deadline = started + (o.deadlineMs ?? 12e4);
   const out = [];
   let budget = TOTAL_TOKENS;
+  const stat = { uris: 0, metaOk: 0, noUri: 0, unreadable: 0, sample: "" };
   const val = async (c, m, a) => {
     const r = await o.view(c, m, a).catch(() => null);
     return r && r.ok ? r.value : void 0;
@@ -1049,7 +1059,7 @@ async function buildCatalog(o) {
     const prices = [...listed.values()].map((l) => BigInt(l.price));
     if (prices.length) col.floor = prices.reduce((m, p) => p < m ? p : m).toString();
     if (typeof curi === "string" && curi.trim()) {
-      const j = parseJson(await fetchThrough(curi.trim(), o.fetchText));
+      const j = parseJson(await fetchThrough(curi.trim(), o.fetchText, o.gateways));
       if (j) {
         col.logo = safeUri(j.image);
         col.banner = safeUri(j.banner_image);
@@ -1066,8 +1076,14 @@ async function buildCatalog(o) {
       const l = listed.get(id);
       const t = { id, name: `${col.name} #${id}`, owner: hexOf(ownerRaw), ...l ? { price: l.price, listingId: l.listingId } : {} };
       if (typeof uri === "string" && uri.trim()) {
-        const j = parseJson(await fetchThrough(uri.trim(), o.fetchText));
+        stat.uris++;
+        const j = parseJson(await fetchThrough(uri.trim(), o.fetchText, o.gateways));
+        if (!j) {
+          stat.unreadable++;
+          if (!stat.sample) stat.sample = uri.trim().slice(0, 80);
+        }
         if (j) {
+          stat.metaOk++;
           const n = str(j.name, 200).trim();
           if (n) t.name = n;
           t.image = safeUri(j.image);
@@ -1083,6 +1099,7 @@ async function buildCatalog(o) {
     col.tokens = take.map((id) => toks.get(id)).filter((t) => !!t);
     out.push(col);
   }
+  o.log?.(`catalog: metadata read for ${stat.metaOk} of ${stat.uris} NFTs with a tokenURI${stat.unreadable ? ` (${stat.unreadable} unreadable, e.g. ${stat.sample})` : ""}`);
   return { version: 1, generatedAt: now(), market: o.market, collections: out };
 }
 var nodeFetchText = async (url, timeoutMs) => {
@@ -1254,7 +1271,7 @@ async function runCycle(rpc, store, cfg, now = Date.now) {
   }));
   if (cfg.catalog) {
     try {
-      const cat = await buildCatalog({ market, collections: all.map((c) => ({ address: c.address, unverified: !listed.has(c.address) })), view: cfg.catalog.view, fetchText: cfg.catalog.fetchText, deadlineMs: cfg.catalog.deadlineMs, now, log });
+      const cat = await buildCatalog({ market, collections: all.map((c) => ({ address: c.address, unverified: !listed.has(c.address) })), view: cfg.catalog.view, fetchText: cfg.catalog.fetchText, gateways: cfg.catalog.gateways, deadlineMs: cfg.catalog.deadlineMs, now, log });
       writeAtomic(join(cfg.outDir, "catalog.json"), JSON.stringify(cat));
       log(`catalog: ${cat.collections.length} collections, ${cat.collections.reduce((n, c) => n + c.tokens.length, 0)} NFTs`);
     } catch (e) {
@@ -1290,7 +1307,7 @@ async function main() {
   const chain = new ChainRpc(url, { timeoutMs: Number(process.env.RPC_TIMEOUT_MS) || 35e3 });
   chain.onEvent = (m) => console.log((/* @__PURE__ */ new Date()).toISOString(), "note:", m);
   const rpc = cfg.source === "legacy" ? new HttpRpc(url) : chain;
-  if (catalogOn) cfg.catalog = { view: (c, m, a) => chain.view(c, m, a), fetchText: nodeFetchText, deadlineMs: Number(process.env.CATALOG_BUDGET_MS) || 12e4 };
+  if (catalogOn) cfg.catalog = { view: (c, m, a) => chain.view(c, m, a), fetchText: nodeFetchText, gateways: gatewaysFrom(process.env.IPFS_GATEWAYS), deadlineMs: Number(process.env.CATALOG_BUDGET_MS) || 12e4 };
   console.log((/* @__PURE__ */ new Date()).toISOString(), `indexer starting: source=${cfg.source}, rpc=${url}, db=${cfg.dbPath}`);
   const interval = Number(process.env.INTERVAL_MS || 1e4);
   let stopping = false;
