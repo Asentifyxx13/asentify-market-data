@@ -89,6 +89,8 @@ jobs:
             for (const c of [...cols, ...found.map((d) => d.address)]) {
               try { fs.writeFileSync("work/api/market/" + c, fs.readFileSync("work/api/market/" + c + ".json", "utf8")); } catch {}
             }
+            // the site asks for /api/market/catalog (no extension): the one-file catalog of NFTs the indexer built
+            try { fs.writeFileSync("work/api/market/catalog", fs.readFileSync("work/api/market/catalog.json", "utf8")); } catch {}
             const status = { updatedAt: new Date().toISOString(), run: process.env.GITHUB_RUN_ID,
               collections: cols.map((c, i) => ({ collection: c, indexedTo: snaps[i]?.meta?.indexedTo ?? null, lastError: snaps[i] ? snaps[i].meta.lastError : "no snapshot" })), discovered: found.length };
             fs.writeFileSync("work/status.json", JSON.stringify(status, null, 2));

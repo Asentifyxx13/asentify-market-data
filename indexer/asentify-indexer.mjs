@@ -1,4 +1,4 @@
-// Asentify market-data indexer (bundled). Source: Asentifyxx13/asentify- (private), branch public-create, commit 0e5428d. Reads the Asentum testnet only; sends no transactions; needs no keys.
+// Asentify market-data indexer (bundled). Source: Asentifyxx13/asentify- (private), branch main, commit b3c4f1c. Reads the Asentum testnet only; sends no transactions; needs no keys.
 
 // indexer/worker.ts
 import { mkdirSync, renameSync, writeFileSync } from "node:fs";
@@ -129,12 +129,12 @@ function polymod(values) {
 var hrpExpand = (hrp) => [...Array.from(hrp, (c) => c.charCodeAt(0) >> 5), 0, ...Array.from(hrp, (c) => c.charCodeAt(0) & 31)];
 function bech32Constant(s2) {
   if (s2 !== s2.toLowerCase() && s2 !== s2.toUpperCase()) return null;
-  const str = s2.toLowerCase();
-  const pos = str.lastIndexOf("1");
-  if (pos < 1 || pos + 7 > str.length || str.length > 90) return null;
-  const hrp = str.slice(0, pos);
+  const str2 = s2.toLowerCase();
+  const pos = str2.lastIndexOf("1");
+  if (pos < 1 || pos + 7 > str2.length || str2.length > 90) return null;
+  const hrp = str2.slice(0, pos);
   const data = [];
-  for (const c of str.slice(pos + 1)) {
+  for (const c of str2.slice(pos + 1)) {
     const d = CHARSET.indexOf(c);
     if (d < 0) return null;
     data.push(d);
@@ -144,10 +144,10 @@ function bech32Constant(s2) {
 function ase1ToHex(addr) {
   const s2 = addr.trim();
   if (bech32Constant(s2) !== 1) throw new Error("invalid ase1 address checksum");
-  const str = s2.toLowerCase();
-  const pos = str.lastIndexOf("1");
-  if (str.slice(0, pos) !== "ase") throw new Error("not an ase1 address");
-  const data = Array.from(str.slice(pos + 1, -6), (c) => CHARSET.indexOf(c));
+  const str2 = s2.toLowerCase();
+  const pos = str2.lastIndexOf("1");
+  if (str2.slice(0, pos) !== "ase") throw new Error("not an ase1 address");
+  const data = Array.from(str2.slice(pos + 1, -6), (c) => CHARSET.indexOf(c));
   let acc = 0, bits = 0;
   const out = [];
   for (const v of data) {
@@ -934,6 +934,173 @@ function tokensToVerify(events, collection, verified, rotateFrom, opts = {}) {
   return { tokens: [...changed, ...rotated], next: rotated.length ? rotated[rotated.length - 1] : rotateFrom };
 }
 
+// indexer/catalog.ts
+var PER_COLLECTION = 24;
+var TOTAL_TOKENS = 96;
+var GATEWAYS = ["https://ipfs.io/ipfs", "https://dweb.link/ipfs", "https://cloudflare-ipfs.com/ipfs"];
+var IPFS = /^ipfs:\/\/([A-Za-z0-9]{20,100}(?:\/[A-Za-z0-9._\-\/]{0,200})?)$/;
+var HTTPS = /^https:\/\/[^\s"'<>]{1,400}$/;
+var HEX = /^0x[0-9a-f]{40}$/;
+var WEI = /^[0-9]{1,40}$/;
+var str = (v, max) => typeof v === "string" ? v.slice(0, max) : "";
+function safeUri(v) {
+  const s2 = typeof v === "string" ? v.trim() : "";
+  return IPFS.test(s2) || HTTPS.test(s2) ? s2 : void 0;
+}
+var hexOf = (v) => {
+  const s2 = typeof v === "string" ? v.trim().toLowerCase() : "";
+  if (HEX.test(s2)) return s2;
+  try {
+    return toHexAddress(s2);
+  } catch {
+    return null;
+  }
+};
+function pickIds(listed, supply, cap = PER_COLLECTION) {
+  const ids = [], seen = /* @__PURE__ */ new Set();
+  for (const id of listed) if (!seen.has(id)) {
+    seen.add(id);
+    ids.push(id);
+  }
+  for (let i = supply; i >= 1 && ids.length < Math.max(cap, listed.length); i--) {
+    const id = String(i);
+    if (!seen.has(id)) {
+      seen.add(id);
+      ids.push(id);
+    }
+  }
+  return { ids, more: supply > ids.length };
+}
+async function fetchThrough(uri, fetchText, gateways = GATEWAYS, timeoutMs = 8e3) {
+  const m = IPFS.exec(uri);
+  const urls = m ? gateways.map((g2) => `${g2}/${m[1]}`) : HTTPS.test(uri) ? [uri] : [];
+  for (const u of urls) {
+    const t = await fetchText(u, timeoutMs).catch(() => null);
+    if (t) return t;
+  }
+  return null;
+}
+function parseJson(t) {
+  if (!t || t.length > 2e5) return null;
+  try {
+    const v = JSON.parse(t);
+    return v && typeof v === "object" && !Array.isArray(v) ? v : null;
+  } catch {
+    return null;
+  }
+}
+function attrs(v) {
+  if (!Array.isArray(v)) return void 0;
+  const out = [];
+  for (const a of v.slice(0, 30)) {
+    if (!a || typeof a !== "object") continue;
+    const t = str(a.trait_type, 60), x = a.value;
+    if (t && typeof x === "string") out.push({ trait_type: t, value: x.slice(0, 120) });
+    else if (t && typeof x === "number" && Number.isFinite(x)) out.push({ trait_type: t, value: x });
+  }
+  return out.length ? out : void 0;
+}
+async function pool(items, size, fn) {
+  let i = 0;
+  await Promise.all(Array.from({ length: Math.min(size, items.length) }, async () => {
+    while (i < items.length) {
+      const x = items[i++];
+      try {
+        await fn(x);
+      } catch {
+      }
+    }
+  }));
+}
+async function buildCatalog(o) {
+  const now = o.now ?? Date.now, started = now(), deadline = started + (o.deadlineMs ?? 12e4);
+  const out = [];
+  let budget = TOTAL_TOKENS;
+  const val = async (c, m, a) => {
+    const r = await o.view(c, m, a).catch(() => null);
+    return r && r.ok ? r.value : void 0;
+  };
+  for (const src of o.collections) {
+    if (now() > deadline) {
+      o.log?.("catalog: time budget reached, remaining collections left out");
+      break;
+    }
+    let hex2;
+    try {
+      hex2 = toHexAddress(src.address);
+    } catch {
+      continue;
+    }
+    const [name, symbol, total, curi] = await Promise.all([val(hex2, "name", []), val(hex2, "symbol", []), val(hex2, "totalSupply", []), val(hex2, "collectionURI", [])]);
+    if (typeof name !== "string" || !/^[0-9]{1,15}$/.test(String(total))) continue;
+    const supply = Number(total);
+    const listed = /* @__PURE__ */ new Map();
+    for (let page = 0; page < 10; page++) {
+      const r = await val(o.market, "listingsOf", [hex2, String(page * 100), "100"]);
+      if (!r || !Array.isArray(r.items)) break;
+      for (const it of r.items) {
+        const l = it || {};
+        const id = String(l.tokenId ?? ""), price = String(l.price ?? ""), exp = Number(l.expiresAt);
+        if (/^[1-9][0-9]{0,29}$/.test(id) && WEI.test(price) && !(Number.isFinite(exp) && exp <= now())) listed.set(id, { price, listingId: String(l.listingId ?? "") });
+      }
+      if ((page + 1) * 100 >= Number(r.total ?? 0)) break;
+    }
+    const col = { address: hex2, name: str(name, 64), symbol: str(symbol, 16), supply, unverified: src.unverified, listedCount: listed.size, floor: null, tokens: [], moreTokens: false };
+    const prices = [...listed.values()].map((l) => BigInt(l.price));
+    if (prices.length) col.floor = prices.reduce((m, p) => p < m ? p : m).toString();
+    if (typeof curi === "string" && curi.trim()) {
+      const j = parseJson(await fetchThrough(curi.trim(), o.fetchText));
+      if (j) {
+        col.logo = safeUri(j.image);
+        col.banner = safeUri(j.banner_image);
+      }
+    }
+    const pick = pickIds([...listed.keys()], supply);
+    col.moreTokens = pick.more;
+    const take = pick.ids.slice(0, Math.max(0, Math.min(pick.ids.length, budget)));
+    budget -= take.length;
+    const toks = /* @__PURE__ */ new Map();
+    await pool(take, 6, async (id) => {
+      if (now() > deadline) return;
+      const [ownerRaw, uri] = await Promise.all([val(hex2, "ownerOf", [id]), val(hex2, "tokenURI", [id])]);
+      const l = listed.get(id);
+      const t = { id, name: `${col.name} #${id}`, owner: hexOf(ownerRaw), ...l ? { price: l.price, listingId: l.listingId } : {} };
+      if (typeof uri === "string" && uri.trim()) {
+        const j = parseJson(await fetchThrough(uri.trim(), o.fetchText));
+        if (j) {
+          const n = str(j.name, 200).trim();
+          if (n) t.name = n;
+          t.image = safeUri(j.image);
+          t.preview = safeUri(j.image_preview);
+          t.attributes = attrs(j.attributes);
+          if (!t.image) delete t.image;
+          if (!t.preview) delete t.preview;
+          if (!t.attributes) delete t.attributes;
+        }
+      }
+      toks.set(id, t);
+    });
+    col.tokens = take.map((id) => toks.get(id)).filter((t) => !!t);
+    out.push(col);
+  }
+  return { version: 1, generatedAt: now(), market: o.market, collections: out };
+}
+var nodeFetchText = async (url, timeoutMs) => {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const r = await fetch(url, { signal: ctrl.signal, redirect: "follow", headers: { accept: "application/json,text/plain" } });
+    if (!r.ok) return null;
+    const len = Number(r.headers.get("content-length") || 0);
+    if (len > 3e5) return null;
+    return (await r.text()).slice(0, 3e5);
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(t);
+  }
+};
+
 // indexer/worker.ts
 var canReadOwners = (r) => !!r && typeof r.ownerOf === "function";
 var byOrder = (a, b) => a.block - b.block || a.logIndex - b.logIndex;
@@ -1085,6 +1252,15 @@ async function runCycle(rpc, store, cfg, now = Date.now) {
     verified: cfg.collections.map((c) => c.address),
     discovered: discovered.filter((d) => !listed.has(d.address)).map((d) => ({ address: d.address, firstSeen: d.firstSeen }))
   }));
+  if (cfg.catalog) {
+    try {
+      const cat = await buildCatalog({ market, collections: all.map((c) => ({ address: c.address, unverified: !listed.has(c.address) })), view: cfg.catalog.view, fetchText: cfg.catalog.fetchText, deadlineMs: cfg.catalog.deadlineMs, now, log });
+      writeAtomic(join(cfg.outDir, "catalog.json"), JSON.stringify(cat));
+      log(`catalog: ${cat.collections.length} collections, ${cat.collections.reduce((n, c) => n + c.tokens.length, 0)} NFTs`);
+    } catch (e) {
+      log(`catalog: skipped: ${e instanceof Error ? e.message : e}`);
+    }
+  }
   if (lastError) throw new Error(lastError);
   return result;
 }
@@ -1108,11 +1284,13 @@ async function main() {
     discover: (process.env.DISCOVER || "").trim().toLowerCase() === "on"
   };
   mkdirSync(join(cfg.dbPath, ".."), { recursive: true });
+  const catalogOn = (process.env.CATALOG || "on").trim().toLowerCase() !== "off";
   const store = new SqliteStore(cfg.dbPath);
   const url = process.env.ASENTUM_RPC || "https://testnet.asentum.com";
   const chain = new ChainRpc(url, { timeoutMs: Number(process.env.RPC_TIMEOUT_MS) || 35e3 });
   chain.onEvent = (m) => console.log((/* @__PURE__ */ new Date()).toISOString(), "note:", m);
   const rpc = cfg.source === "legacy" ? new HttpRpc(url) : chain;
+  if (catalogOn) cfg.catalog = { view: (c, m, a) => chain.view(c, m, a), fetchText: nodeFetchText, deadlineMs: Number(process.env.CATALOG_BUDGET_MS) || 12e4 };
   console.log((/* @__PURE__ */ new Date()).toISOString(), `indexer starting: source=${cfg.source}, rpc=${url}, db=${cfg.dbPath}`);
   const interval = Number(process.env.INTERVAL_MS || 1e4);
   let stopping = false;
