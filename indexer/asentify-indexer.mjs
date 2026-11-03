@@ -1,4 +1,4 @@
-// Asentify market-data indexer (bundled). Source: Asentifyxx13/asentify- (private), branch catalog-metadata, commit 04e753d. Reads the Asentum testnet only; sends no transactions; needs no keys.
+// Asentify market-data indexer (bundled). Source: Asentifyxx13/asentify- (private), branch main, commit 9bc695f. Reads the Asentum testnet only; sends no transactions; needs no keys.
 
 // indexer/worker.ts
 import { mkdirSync, renameSync, writeFileSync } from "node:fs";
@@ -1081,6 +1081,8 @@ async function buildCatalog(o) {
         if (!j) {
           stat.unreadable++;
           if (!stat.sample) stat.sample = uri.trim().slice(0, 80);
+          const su = safeUri(uri);
+          if (su) t.uri = su;
         }
         if (j) {
           stat.metaOk++;
