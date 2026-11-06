@@ -32,6 +32,7 @@ jobs:
       SOURCE: logs                 # eth_getLogs in ≤500-block ranges; a range that keeps failing is read from receipts
       DISCOVER: "on"               # also index collections people create, found through the marketplace's events (published as "discovered")
       ONCE: "1"
+      IPFS_GATEWAYS: "https://purple-past-buzzard-33.mypinata.cloud/ipfs,https://ipfs.io/ipfs,https://dweb.link/ipfs,https://w3s.link/ipfs,https://gateway.pinata.cloud/ipfs"   # your own gateway first, public ones as backups
       DB_PATH: work/data/indexer.sqlite
       OUT_DIR: work/api/market
     steps:
