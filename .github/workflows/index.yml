@@ -74,6 +74,15 @@ jobs:
           mkdir -p work/data work/api/market
           node --no-warnings indexer/asentify-indexer.mjs
 
+      - name: Announce new listings and sales on Telegram
+        continue-on-error: true    # never blocks publishing
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SITE_URL: https://asentify.app
+          ANNOUNCE_STATE: work/data/announced.json
+        run: node --no-warnings indexer/asentify-announce.mjs
+
       - name: Write the public config (same shape as the website's /api/market/config)
         run: |
           node -e '
