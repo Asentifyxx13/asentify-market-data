@@ -1,0 +1,46 @@
+# Makes small WebP previews (256 / 512 / 1024 px) of the pictures in the published catalog and uploads them to
+# Cloudflare R2, where the website loads them (NEXT_PUBLIC_MEDIA_CDN). The NFTs' real pictures stay on IPFS.
+# Pictures that already have previews are skipped, so a run with nothing new takes a few seconds.
+# Needs the repository secrets R2_ACCOUNT_ID, R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY; without them it does nothing.
+name: thumbs
+
+on:
+  schedule:
+    - cron: "17,47 * * * *"       # every 30 minutes
+  workflow_dispatch: {}
+
+permissions:
+  contents: read                   # reads the catalog from the data branch; writes nothing to the repository
+
+concurrency:
+  group: thumbs
+  cancel-in-progress: false
+
+jobs:
+  thumbs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      R2_BUCKET: asentify-media
+      R2_PUBLIC_URL: https://pub-b5bab67b0d324a5482a25bd04fdf9267.r2.dev
+      IPFS_GATEWAYS: "https://purple-past-buzzard-33.mypinata.cloud/ipfs,https://ipfs.io/ipfs,https://dweb.link/ipfs,https://w3s.link/ipfs"
+      CATALOG_FILE: data/api/market/catalog.json
+      THUMBS_BUDGET_MS: "480000"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read the published catalog (data branch)
+        uses: actions/checkout@v4
+        with:
+          ref: data
+          path: data
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install the image library (sharp)
+        run: npm install --no-save --no-audit --no-fund --prefix indexer sharp@^0.34
+      - name: Make and upload previews
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: node --no-warnings indexer/asentify-thumbs.mjs
