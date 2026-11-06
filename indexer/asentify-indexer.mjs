@@ -1,4 +1,4 @@
-// Asentify market-data indexer (bundled). Source: Asentifyxx13/asentify- (private), branch main, commit 9bc695f. Reads the Asentum testnet only; sends no transactions; needs no keys.
+// Asentify market-data indexer (bundled). Source: Asentifyxx13/asentify- (private), branch main, commit dfc08f6. Reads the Asentum testnet only; sends no transactions; needs no keys.
 
 // indexer/worker.ts
 import { mkdirSync, renameSync, writeFileSync } from "node:fs";
@@ -1041,9 +1041,10 @@ async function buildCatalog(o) {
     } catch {
       continue;
     }
-    const [name, symbol, total, curi] = await Promise.all([val(hex2, "name", []), val(hex2, "symbol", []), val(hex2, "totalSupply", []), val(hex2, "collectionURI", [])]);
+    const [name, symbol, total, curi, minted] = await Promise.all([val(hex2, "name", []), val(hex2, "symbol", []), val(hex2, "totalSupply", []), val(hex2, "collectionURI", []), val(hex2, "totalMinted", [])]);
     if (typeof name !== "string" || !/^[0-9]{1,15}$/.test(String(total))) continue;
     const supply = Number(total);
+    const top = /^[0-9]{1,15}$/.test(String(minted)) && Number(minted) > supply ? Number(minted) : supply;
     const listed = /* @__PURE__ */ new Map();
     for (let page = 0; page < 10; page++) {
       const r = await val(o.market, "listingsOf", [hex2, String(page * 100), "100"]);
@@ -1065,7 +1066,7 @@ async function buildCatalog(o) {
         col.banner = safeUri(j.banner_image);
       }
     }
-    const pick = pickIds([...listed.keys()], supply);
+    const pick = pickIds([...listed.keys()], top);
     col.moreTokens = pick.more;
     const take = pick.ids.slice(0, Math.max(0, Math.min(pick.ids.length, budget)));
     budget -= take.length;
@@ -1073,6 +1074,7 @@ async function buildCatalog(o) {
     await pool(take, 6, async (id) => {
       if (now() > deadline) return;
       const [ownerRaw, uri] = await Promise.all([val(hex2, "ownerOf", [id]), val(hex2, "tokenURI", [id])]);
+      if (ownerRaw === void 0 && await val(hex2, "exists", [id]) === false) return;
       const l = listed.get(id);
       const t = { id, name: `${col.name} #${id}`, owner: hexOf(ownerRaw), ...l ? { price: l.price, listingId: l.listingId } : {} };
       if (typeof uri === "string" && uri.trim()) {
