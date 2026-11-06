@@ -1,4 +1,4 @@
-// Asentify market-data indexer (bundled). Source: Asentifyxx13/asentify- (private), branch main, commit dfc08f6. Reads the Asentum testnet only; sends no transactions; needs no keys.
+// Asentify market-data indexer (bundled). Source: Asentifyxx13/asentify- (private), branch main, commit 8369a46. Reads the Asentum testnet only; sends no transactions; needs no keys.
 
 // indexer/worker.ts
 import { mkdirSync, renameSync, writeFileSync } from "node:fs";
@@ -833,7 +833,7 @@ async function syncLogs(rpc, store, opts = {}) {
     let found = 0, sinceLog = 0;
     if (from <= finalized) opts.log?.(`logs: ${address.slice(0, 10)}\u2026 blocks ${from}-${finalized} (${finalized - from + 1} to read)`);
     while (from <= finalized) {
-      if (ranges >= maxRanges) {
+      if (ranges >= maxRanges || opts.deadline && (opts.clock ?? Date.now)() > opts.deadline) {
         complete = false;
         break;
       }
@@ -849,6 +849,10 @@ async function syncLogs(rpc, store, opts = {}) {
           continue;
         }
         if (!opts.fallback) throw new Error(`eth_getLogs blocks ${from}-${to}: ${e instanceof Error ? e.message : String(e)}`);
+        if (opts.deadline && (opts.clock ?? Date.now)() > opts.deadline) {
+          complete = false;
+          break;
+        }
         opts.log?.(`eth_getLogs failed for ${address} ${from}-${to}; reading these blocks from receipts instead`);
         events = (await scanRange(opts.fallback, from, to, /* @__PURE__ */ new Set([toHexAddress(address)]))).events;
         fallbacks++;
@@ -1207,6 +1211,8 @@ async function runCycle(rpc, store, cfg, now = Date.now) {
   const known = () => cfg.discover ? discoverCollections(store, market, listed, cfg.marketStart, dOpts) : { all: [], added: [] };
   for (const d of known().all) store.watch(d.address, d.start);
   let lastError = null, result = null;
+  const cycleStart = Date.now();
+  const deadline = () => cycleStart + (cfg.syncBudgetMs ?? 15 * 6e4);
   const sync = async () => {
     const source = cfg.source || "legacy";
     if (source === "receipts") {
@@ -1214,7 +1220,7 @@ async function runCycle(rpc, store, cfg, now = Date.now) {
       const r = await syncReceipts(rpc, store, { now, maxBlocks: cfg.maxBlocks });
       result = { finalized: r.finalized, newEvents: r.newEvents, ranges: r.blocks, complete: r.complete };
     } else if (source === "logs") {
-      const r = await syncLogs(rpc, store, { now, fallback: isBlockSource(rpc) ? rpc : null, log: (m) => console.log((/* @__PURE__ */ new Date()).toISOString(), m) });
+      const r = await syncLogs(rpc, store, { now, fallback: isBlockSource(rpc) ? rpc : null, log: (m) => console.log((/* @__PURE__ */ new Date()).toISOString(), m), deadline: deadline() });
       result = { finalized: r.finalized, newEvents: r.newEvents, ranges: r.ranges, complete: r.complete };
     } else {
       result = await syncOnce(rpc, store, { now });
@@ -1238,9 +1244,13 @@ async function runCycle(rpc, store, cfg, now = Date.now) {
   const all = [...cfg.collections, ...discovered.filter((d) => !listed.has(d.address)).map((d) => ({ address: d.address, start: d.start, complete: false }))];
   const collections = new Set(all.map((c) => c.address));
   const log = (m) => console.log((/* @__PURE__ */ new Date()).toISOString(), m);
-  if (!lastError && cfg.verifyOwners !== false && canReadOwners(rpc)) {
+  if (!lastError && cfg.verifyOwners !== false && canReadOwners(rpc) && Date.now() < deadline()) {
     const at = store.meta().finalizedSeen ?? 0;
     for (const c of all) {
+      if (Date.now() > deadline()) {
+        log("owners: out of time this cycle; checked again next cycle");
+        break;
+      }
       try {
         await verifyOwners(rpc, store, market, c.address, collections, at, { log });
       } catch (e) {
@@ -1302,7 +1312,8 @@ async function main() {
     outDir: process.env.OUT_DIR || "./data/market",
     source: parseSource(process.env.SOURCE),
     maxBlocks: Number(process.env.MAX_BLOCKS) || void 0,
-    discover: (process.env.DISCOVER || "").trim().toLowerCase() === "on"
+    discover: (process.env.DISCOVER || "").trim().toLowerCase() === "on",
+    syncBudgetMs: Number(process.env.SYNC_BUDGET_MS) || void 0
   };
   mkdirSync(join(cfg.dbPath, ".."), { recursive: true });
   const catalogOn = (process.env.CATALOG || "on").trim().toLowerCase() !== "off";
