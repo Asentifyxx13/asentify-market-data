@@ -1,4 +1,4 @@
-// Asentify picture previews (bundled). Source: Asentifyxx13/asentify- (private), indexer/thumbs.ts, commit 470a7d9. Makes small WebP copies of catalog pictures and uploads them to Cloudflare R2.
+// Asentify picture previews (bundled). Source: Asentifyxx13/asentify- (private), indexer/thumbs.ts, commit 8447c0e. Makes small WebP copies of catalog pictures and uploads them to Cloudflare R2.
 
 // indexer/thumbs.ts
 import { createHash, createHmac } from "node:crypto";
@@ -7,12 +7,24 @@ import { readFileSync } from "node:fs";
 // src/lib/media/cdn.ts
 var CDN = (() => {
   const v = (process.env.NEXT_PUBLIC_MEDIA_CDN || "").trim().replace(/\/+$/, "");
+  if (/^\/[a-z0-9/_-]{1,40}$/i.test(v)) return v;
   try {
     return v && new URL(v).protocol === "https:" ? v : "";
   } catch {
     return "";
   }
 })();
+var known = null;
+var started = false;
+function loadCdnIndex(base = CDN, f = (...a) => fetch(...a)) {
+  if (!base || started) return Promise.resolve();
+  started = true;
+  return f(`${base}/thumbs/index.json`, { cache: "no-cache" }).then((r) => r.ok ? r.json() : null).then((j) => {
+    if (j && Array.isArray(j.keys)) known = new Set(j.keys.filter((k) => typeof k === "string"));
+  }).catch(() => {
+  });
+}
+if (typeof window !== "undefined") loadCdnIndex();
 var FORMAT = /^(avif|webp|jpeg)$/.test(process.env.NEXT_PUBLIC_MEDIA_THUMB_FORMAT || "") ? process.env.NEXT_PUBLIC_MEDIA_THUMB_FORMAT : "webp";
 var CID = "(?:Qm[1-9A-HJ-NP-Za-km-z]{44}|b[a-z2-7]{50,100})";
 var CID_IN_URL = new RegExp(`/ipfs/(${CID})(?:/|$|\\?)`);
@@ -47,12 +59,12 @@ function r2ConfigFrom(env) {
   if (!/^[0-9a-f]{32}$/.test(account) || !accessKey || !secretKey || !/^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/.test(bucket) || !/^https:\/\/[^\s/]+$/.test(publicUrl)) return null;
   return { account, accessKey, secretKey, bucket, publicUrl };
 }
-function putRequest(cfg, key, body, contentType, now = /* @__PURE__ */ new Date()) {
+function putRequest(cfg, key, body, contentType, now = /* @__PURE__ */ new Date(), cacheControl = "public, max-age=31536000, immutable") {
   const host = `${cfg.account}.r2.cloudflarestorage.com`;
   const url = `https://${host}/${cfg.bucket}/${key}`;
   const amzDate = now.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
   const payloadHash = sha256hex(body);
-  const headers = { host, "x-amz-date": amzDate, "x-amz-content-sha256": payloadHash, "content-type": contentType, "cache-control": "public, max-age=31536000, immutable" };
+  const headers = { host, "x-amz-date": amzDate, "x-amz-content-sha256": payloadHash, "content-type": contentType, "cache-control": cacheControl };
   headers.authorization = signV4({ method: "PUT", url, headers, payloadHash, region: "auto", service: "s3", accessKey: cfg.accessKey, secretKey: cfg.secretKey, amzDate });
   return { url, headers };
 }
@@ -89,6 +101,7 @@ async function fetchBytes(f, url, timeoutMs) {
 async function makeThumbs(cfg, pictures, gateways, d, budgetMs = 18e4) {
   const end = d.now() + budgetMs;
   let done = 0, had = 0, skipped = 0, i = 0;
+  const present = [];
   const worker = async () => {
     while (i < pictures.length && d.now() < end) {
       const p = pictures[i++];
@@ -96,6 +109,7 @@ async function makeThumbs(cfg, pictures, gateways, d, budgetMs = 18e4) {
         const head = await d.fetch(`${cfg.publicUrl}/thumbs/${p.key}/1024.webp`, { method: "HEAD" }).catch(() => null);
         if (head?.ok) {
           had++;
+          present.push(p.key);
           continue;
         }
         const path = p.ref.replace(/^ipfs:\/\//, "");
@@ -125,8 +139,10 @@ async function makeThumbs(cfg, pictures, gateways, d, budgetMs = 18e4) {
           ok = !!r?.ok;
           if (!ok) d.log(`thumbs: upload refused (${r ? r.status : "no answer"}) for ${p.key}`);
         }
-        if (ok) done++;
-        else skipped++;
+        if (ok) {
+          done++;
+          present.push(p.key);
+        } else skipped++;
       } catch {
         skipped++;
       }
@@ -135,7 +151,24 @@ async function makeThumbs(cfg, pictures, gateways, d, budgetMs = 18e4) {
   await Promise.all([worker(), worker(), worker()]);
   const left = pictures.length - done - had - skipped;
   d.log(`thumbs: ${done} new, ${had} already there, ${skipped} skipped, ${left} left for next run (of ${pictures.length})`);
-  return { done, had, skipped, left };
+  return { done, had, skipped, left, present };
+}
+async function writeIndex(cfg, present, d) {
+  let earlier = [];
+  try {
+    const r2 = await d.fetch(`${cfg.publicUrl}/thumbs/index.json`, { cache: "no-store" });
+    if (r2.ok) {
+      const j = await r2.json();
+      if (Array.isArray(j?.keys)) earlier = j.keys.filter((k) => typeof k === "string");
+    }
+  } catch {
+  }
+  const keys = [.../* @__PURE__ */ new Set([...earlier, ...present])].sort();
+  const body = new TextEncoder().encode(JSON.stringify({ version: 1, keys }));
+  const rq = putRequest(cfg, "thumbs/index.json", body, "application/json", /* @__PURE__ */ new Date(), "public, max-age=300");
+  const r = await d.fetch(rq.url, { method: "PUT", headers: rq.headers, body }).catch(() => null);
+  d.log(r?.ok ? `thumbs: index lists ${keys.length} pictures` : `thumbs: index upload refused (${r ? r.status : "no answer"})`);
+  return !!r?.ok;
 }
 async function sharpResize() {
   try {
@@ -177,7 +210,9 @@ async function main(env = process.env) {
     return;
   }
   const gateways = (env.IPFS_GATEWAYS || "https://ipfs.io/ipfs,https://dweb.link/ipfs").split(",").map((x) => x.trim().replace(/\/+$/, "")).filter((x) => /^https:\/\//.test(x)).slice(0, 6);
-  await makeThumbs(cfg, picturesOf(catalog), gateways, { fetch, resize, log: (s) => console.log(s), now: () => Date.now() }, Number(env.THUMBS_BUDGET_MS) || 18e4);
+  const deps = { fetch, resize, log: (s) => console.log(s), now: () => Date.now() };
+  const r = await makeThumbs(cfg, picturesOf(catalog), gateways, deps, Number(env.THUMBS_BUDGET_MS) || 18e4);
+  await writeIndex(cfg, r.present, deps);
 }
 if (process.argv[1] && /(indexer\/thumbs\.ts|asentify-thumbs\.mjs)$/.test(process.argv[1])) main().catch((e) => {
   console.log("thumbs: stopped: " + (e instanceof Error ? e.message : String(e)));
@@ -190,5 +225,6 @@ export {
   putRequest,
   r2ConfigFrom,
   sharpResize,
-  signV4
+  signV4,
+  writeIndex
 };
