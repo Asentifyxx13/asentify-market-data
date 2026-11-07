@@ -1,7 +1,7 @@
-// Asentify market-data indexer (bundled). Source: Asentifyxx13/asentify- (private), branch indexer/receipts-source, commit c114e64. Reads the Asentum testnet only; sends no transactions; needs no keys.
+// Asentify market-data indexer (bundled). Source: Asentifyxx13/asentify- (private), branch catalog-keep, commit e8d4e4c. Reads the Asentum testnet only; sends no transactions; needs no keys.
 
 // indexer/worker.ts
-import { mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 // src/lib/indexer/blake3.ts
@@ -129,12 +129,12 @@ function polymod(values) {
 var hrpExpand = (hrp) => [...Array.from(hrp, (c) => c.charCodeAt(0) >> 5), 0, ...Array.from(hrp, (c) => c.charCodeAt(0) & 31)];
 function bech32Constant(s2) {
   if (s2 !== s2.toLowerCase() && s2 !== s2.toUpperCase()) return null;
-  const str = s2.toLowerCase();
-  const pos = str.lastIndexOf("1");
-  if (pos < 1 || pos + 7 > str.length || str.length > 90) return null;
-  const hrp = str.slice(0, pos);
+  const str2 = s2.toLowerCase();
+  const pos = str2.lastIndexOf("1");
+  if (pos < 1 || pos + 7 > str2.length || str2.length > 90) return null;
+  const hrp = str2.slice(0, pos);
   const data = [];
-  for (const c of str.slice(pos + 1)) {
+  for (const c of str2.slice(pos + 1)) {
     const d = CHARSET.indexOf(c);
     if (d < 0) return null;
     data.push(d);
@@ -144,10 +144,10 @@ function bech32Constant(s2) {
 function ase1ToHex(addr) {
   const s2 = addr.trim();
   if (bech32Constant(s2) !== 1) throw new Error("invalid ase1 address checksum");
-  const str = s2.toLowerCase();
-  const pos = str.lastIndexOf("1");
-  if (str.slice(0, pos) !== "ase") throw new Error("not an ase1 address");
-  const data = Array.from(str.slice(pos + 1, -6), (c) => CHARSET.indexOf(c));
+  const str2 = s2.toLowerCase();
+  const pos = str2.lastIndexOf("1");
+  if (str2.slice(0, pos) !== "ase") throw new Error("not an ase1 address");
+  const data = Array.from(str2.slice(pos + 1, -6), (c) => CHARSET.indexOf(c));
   let acc = 0, bits = 0;
   const out = [];
   for (const v of data) {
@@ -412,7 +412,11 @@ function dailySeries(sales, nowMs, days) {
 
 // src/lib/indexer/snapshot.ts
 var SNAPSHOT_VERSION = 1;
-var STALE_AFTER_MS = 5 * 6e4;
+function staleAfterMs(raw) {
+  const n = Number((raw ?? "").trim());
+  return Number.isFinite(n) && n >= 1 && n <= 240 ? Math.round(n * 6e4) : 5 * 6e4;
+}
+var STALE_AFTER_MS = staleAfterMs(typeof process !== "undefined" ? process.env.NEXT_PUBLIC_MARKET_STALE_MINUTES : void 0);
 var s = (v) => v === null ? null : v.toString();
 function buildSnapshot(input, lastError = null) {
   const st = collectionStats(input);
@@ -829,7 +833,7 @@ async function syncLogs(rpc, store, opts = {}) {
     let found = 0, sinceLog = 0;
     if (from <= finalized) opts.log?.(`logs: ${address.slice(0, 10)}\u2026 blocks ${from}-${finalized} (${finalized - from + 1} to read)`);
     while (from <= finalized) {
-      if (ranges >= maxRanges) {
+      if (ranges >= maxRanges || opts.deadline && (opts.clock ?? Date.now)() > opts.deadline) {
         complete = false;
         break;
       }
@@ -845,6 +849,10 @@ async function syncLogs(rpc, store, opts = {}) {
           continue;
         }
         if (!opts.fallback) throw new Error(`eth_getLogs blocks ${from}-${to}: ${e instanceof Error ? e.message : String(e)}`);
+        if (opts.deadline && (opts.clock ?? Date.now)() > opts.deadline) {
+          complete = false;
+          break;
+        }
         opts.log?.(`eth_getLogs failed for ${address} ${from}-${to}; reading these blocks from receipts instead`);
         events = (await scanRange(opts.fallback, from, to, /* @__PURE__ */ new Set([toHexAddress(address)]))).events;
         fallbacks++;
@@ -930,6 +938,233 @@ function tokensToVerify(events, collection, verified, rotateFrom, opts = {}) {
   return { tokens: [...changed, ...rotated], next: rotated.length ? rotated[rotated.length - 1] : rotateFrom };
 }
 
+// indexer/catalog.ts
+var PER_COLLECTION = 24;
+var TOTAL_TOKENS = 96;
+var GATEWAYS = ["https://ipfs.io/ipfs", "https://dweb.link/ipfs", "https://w3s.link/ipfs", "https://gateway.pinata.cloud/ipfs"];
+function gatewaysFrom(raw) {
+  const l = (raw || "").split(",").map((x) => x.trim().replace(/\/+$/, "")).filter((x) => /^https:\/\/[^\s"'<>]{1,200}$/.test(x));
+  return l.length ? l.slice(0, 6) : GATEWAYS;
+}
+var IPFS = /^ipfs:\/\/([A-Za-z0-9]{20,100}(?:\/[A-Za-z0-9._\-\/]{0,200})?)$/;
+var HTTPS = /^https:\/\/[^\s"'<>]{1,400}$/;
+var HEX = /^0x[0-9a-f]{40}$/;
+var WEI = /^[0-9]{1,40}$/;
+var str = (v, max) => typeof v === "string" ? v.slice(0, max) : "";
+function safeUri(v) {
+  const s2 = typeof v === "string" ? v.trim() : "";
+  return IPFS.test(s2) || HTTPS.test(s2) ? s2 : void 0;
+}
+var hexOf = (v) => {
+  const s2 = typeof v === "string" ? v.trim().toLowerCase() : "";
+  if (HEX.test(s2)) return s2;
+  try {
+    return toHexAddress(s2);
+  } catch {
+    return null;
+  }
+};
+function pickIds(listed, supply, cap = PER_COLLECTION) {
+  const ids = [], seen = /* @__PURE__ */ new Set();
+  for (const id of listed) if (!seen.has(id)) {
+    seen.add(id);
+    ids.push(id);
+  }
+  for (let i = supply; i >= 1 && ids.length < Math.max(cap, listed.length); i--) {
+    const id = String(i);
+    if (!seen.has(id)) {
+      seen.add(id);
+      ids.push(id);
+    }
+  }
+  return { ids, more: supply > ids.length };
+}
+async function fetchThrough(uri, fetchText, gateways = GATEWAYS, timeoutMs = 1e4) {
+  const m = IPFS.exec(uri);
+  const urls = m ? gateways.map((g2) => `${g2}/${m[1]}`) : HTTPS.test(uri) ? [uri] : [];
+  if (!urls.length) return null;
+  return new Promise((resolve) => {
+    let left = urls.length;
+    for (const u of urls) {
+      fetchText(u, timeoutMs).catch(() => null).then((t) => {
+        if (t) resolve(t);
+        else if (--left === 0) resolve(null);
+      });
+    }
+  });
+}
+function parseJson(t) {
+  if (!t || t.length > 2e5) return null;
+  try {
+    const v = JSON.parse(t);
+    return v && typeof v === "object" && !Array.isArray(v) ? v : null;
+  } catch {
+    return null;
+  }
+}
+function attrs(v) {
+  if (!Array.isArray(v)) return void 0;
+  const out = [];
+  for (const a of v.slice(0, 30)) {
+    if (!a || typeof a !== "object") continue;
+    const t = str(a.trait_type, 60), x = a.value;
+    if (t && typeof x === "string") out.push({ trait_type: t, value: x.slice(0, 120) });
+    else if (t && typeof x === "number" && Number.isFinite(x)) out.push({ trait_type: t, value: x });
+  }
+  return out.length ? out : void 0;
+}
+async function pool(items, size, fn) {
+  let i = 0;
+  await Promise.all(Array.from({ length: Math.min(size, items.length) }, async () => {
+    while (i < items.length) {
+      const x = items[i++];
+      try {
+        await fn(x);
+      } catch {
+      }
+    }
+  }));
+}
+async function buildCatalog(o) {
+  const now = o.now ?? Date.now, started = now(), deadline = started + (o.deadlineMs ?? 12e4);
+  const out = [];
+  let budget = TOTAL_TOKENS;
+  const stat = { uris: 0, metaOk: 0, noUri: 0, unreadable: 0, sample: "" };
+  const val = async (c, m, a) => {
+    const r = await o.view(c, m, a).catch(() => null);
+    return r && r.ok ? r.value : void 0;
+  };
+  const prev = /* @__PURE__ */ new Map();
+  for (const c of o.previous && Array.isArray(o.previous.collections) ? o.previous.collections : []) if (c && typeof c.address === "string") prev.set(c.address.toLowerCase(), c);
+  const n = o.collections.length, shift = n ? Math.floor(started / 36e5) % n : 0;
+  const order = o.collections.map((_, i) => o.collections[(i + shift) % n]);
+  let outOfTime = false;
+  for (const src of order) {
+    if (now() > deadline) {
+      if (!outOfTime) o.log?.("catalog: time budget reached; the rest keep their entry from the last catalog");
+      outOfTime = true;
+      break;
+    }
+    let hex2;
+    try {
+      hex2 = toHexAddress(src.address);
+    } catch {
+      continue;
+    }
+    const [name, symbol, total, curi, minted] = await Promise.all([val(hex2, "name", []), val(hex2, "symbol", []), val(hex2, "totalSupply", []), val(hex2, "collectionURI", []), val(hex2, "totalMinted", [])]);
+    if (typeof name !== "string" || !/^[0-9]{1,15}$/.test(String(total))) continue;
+    const supply = Number(total);
+    const top = /^[0-9]{1,15}$/.test(String(minted)) && Number(minted) > supply ? Number(minted) : supply;
+    const listed = /* @__PURE__ */ new Map();
+    for (let page = 0; page < 10; page++) {
+      const r = await val(o.market, "listingsOf", [hex2, String(page * 100), "100"]);
+      if (!r || !Array.isArray(r.items)) break;
+      for (const it of r.items) {
+        const l = it || {};
+        const id = String(l.tokenId ?? ""), price = String(l.price ?? ""), exp = Number(l.expiresAt);
+        if (/^[1-9][0-9]{0,29}$/.test(id) && WEI.test(price) && !(Number.isFinite(exp) && exp <= now())) listed.set(id, { price, listingId: String(l.listingId ?? "") });
+      }
+      if ((page + 1) * 100 >= Number(r.total ?? 0)) break;
+    }
+    const col = { address: hex2, name: str(name, 64), symbol: str(symbol, 16), supply, unverified: src.unverified, listedCount: listed.size, floor: null, tokens: [], moreTokens: false };
+    const prices = [...listed.values()].map((l) => BigInt(l.price));
+    if (prices.length) col.floor = prices.reduce((m, p) => p < m ? p : m).toString();
+    if (typeof curi === "string" && curi.trim()) {
+      const j = parseJson(await fetchThrough(curi.trim(), o.fetchText, o.gateways));
+      if (j) {
+        col.logo = safeUri(j.image);
+        col.banner = safeUri(j.banner_image);
+      }
+    }
+    const pick = pickIds([...listed.keys()], top);
+    col.moreTokens = pick.more;
+    const take = pick.ids.slice(0, Math.max(0, Math.min(pick.ids.length, budget)));
+    budget -= take.length;
+    const toks = /* @__PURE__ */ new Map();
+    await pool(take, 6, async (id) => {
+      if (now() > deadline) return;
+      const [ownerRaw, uri] = await Promise.all([val(hex2, "ownerOf", [id]), val(hex2, "tokenURI", [id])]);
+      if (ownerRaw === void 0 && await val(hex2, "exists", [id]) === false) return;
+      const l = listed.get(id);
+      const t = { id, name: `${col.name} #${id}`, owner: hexOf(ownerRaw), ...l ? { price: l.price, listingId: l.listingId } : {} };
+      if (typeof uri === "string" && uri.trim()) {
+        stat.uris++;
+        const j = parseJson(await fetchThrough(uri.trim(), o.fetchText, o.gateways));
+        if (!j) {
+          stat.unreadable++;
+          if (!stat.sample) stat.sample = uri.trim().slice(0, 80);
+          const su = safeUri(uri);
+          if (su) t.uri = su;
+        }
+        if (j) {
+          stat.metaOk++;
+          const n2 = str(j.name, 200).trim();
+          if (n2) t.name = n2;
+          t.image = safeUri(j.image);
+          t.preview = safeUri(j.image_preview);
+          t.attributes = attrs(j.attributes);
+          if (!t.image) delete t.image;
+          if (!t.preview) delete t.preview;
+          if (!t.attributes) delete t.attributes;
+        }
+      }
+      toks.set(id, t);
+    });
+    const before = prev.get(hex2);
+    const old = new Map((before?.tokens ?? []).map((t) => [t.id, t]));
+    col.tokens = take.map((id) => toks.get(id) ?? (old.has(id) ? { ...old.get(id), ...listed.has(id) ? { price: listed.get(id).price, listingId: listed.get(id).listingId } : { price: void 0, listingId: void 0 } } : void 0)).filter((t) => !!t);
+    for (const t of col.tokens) {
+      if (t.price === void 0) delete t.price;
+      if (t.listingId === void 0) delete t.listingId;
+    }
+    if (!col.logo && before?.logo) col.logo = before.logo;
+    if (!col.banner && before?.banner) col.banner = before.banner;
+    out.push(col);
+  }
+  const have = new Set(out.map((c) => c.address));
+  let kept = 0;
+  for (const src of o.collections) {
+    let hex2;
+    try {
+      hex2 = toHexAddress(src.address).toLowerCase();
+    } catch {
+      continue;
+    }
+    const p = prev.get(hex2);
+    if (!have.has(hex2) && p) {
+      out.push({ ...p, unverified: src.unverified });
+      have.add(hex2);
+      kept++;
+    }
+  }
+  if (kept) o.log?.(`catalog: kept ${kept} collection(s) from the last catalog`);
+  const rank = new Map(o.collections.map((c, i) => {
+    try {
+      return [toHexAddress(c.address).toLowerCase(), i];
+    } catch {
+      return ["", i];
+    }
+  }));
+  out.sort((a, b) => (rank.get(a.address) ?? 1e9) - (rank.get(b.address) ?? 1e9));
+  o.log?.(`catalog: metadata read for ${stat.metaOk} of ${stat.uris} NFTs with a tokenURI${stat.unreadable ? ` (${stat.unreadable} unreadable, e.g. ${stat.sample})` : ""}`);
+  return { version: 1, generatedAt: now(), market: o.market, collections: out };
+}
+var nodeFetchText = async (url, timeoutMs) => {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const r = await fetch(url, { signal: ctrl.signal, redirect: "follow", headers: { accept: "application/json,text/plain" } });
+    if (!r.ok) return null;
+    const len = Number(r.headers.get("content-length") || 0);
+    if (len > 3e5) return null;
+    return (await r.text()).slice(0, 3e5);
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(t);
+  }
+};
+
 // indexer/worker.ts
 var canReadOwners = (r) => !!r && typeof r.ownerOf === "function";
 var byOrder = (a, b) => a.block - b.block || a.logIndex - b.logIndex;
@@ -958,6 +1193,35 @@ async function verifyOwners(rpc, store, market, collection, collections, atBlock
   if (tokens.length) opts.log?.(`owners: checked ${rows.length}/${tokens.length} tokens of ${collection.slice(0, 10)}\u2026 on chain${unknown ? ` (${unknown} unreadable, kept previous)` : ""}`);
   return { checked: rows.length, unknown };
 }
+var DISCOVER_LOOKBACK = 4e4;
+var DISCOVER_MAX = 50;
+var MARKET_KINDS = /* @__PURE__ */ new Set(["Listed", "Sold", "OfferMade", "OfferAccepted", "ListingCancelled"]);
+var HEX40 = /^0x[0-9a-f]{40}$/;
+function discoverCollections(store, market, known, marketStart, opts = {}) {
+  const lookback = opts.lookback ?? DISCOVER_LOOKBACK, max = opts.max ?? DISCOVER_MAX;
+  let all = [];
+  try {
+    const v = JSON.parse(store.getKV("discovered") || "[]");
+    if (Array.isArray(v)) all = v.filter((d) => d && HEX40.test(d.address) && Number.isInteger(d.start) && Number.isInteger(d.firstSeen));
+  } catch {
+    all = [];
+  }
+  const have = /* @__PURE__ */ new Set([...known, ...all.map((d) => d.address), market]);
+  const added = [];
+  for (const e of store.events([market])) {
+    if (all.length + added.length >= max) break;
+    if (!MARKET_KINDS.has(e.name)) continue;
+    const c = typeof e.data.collection === "string" ? e.data.collection.toLowerCase() : "";
+    if (!HEX40.test(c) || have.has(c)) continue;
+    have.add(c);
+    added.push({ address: c, firstSeen: e.block, start: Math.max(marketStart, e.block - lookback) });
+  }
+  if (added.length) {
+    all = [...all, ...added];
+    store.setKV("discovered", JSON.stringify(all));
+  }
+  return { all, added };
+}
 function parseSource(v) {
   const s2 = (v || "logs").trim().toLowerCase();
   if (s2 === "logs" || s2 === "receipts" || s2 === "legacy") return s2;
@@ -981,27 +1245,51 @@ async function runCycle(rpc, store, cfg, now = Date.now) {
   const market = toHexAddress(cfg.market);
   store.watch(market, cfg.marketStart);
   for (const c of cfg.collections) store.watch(c.address, c.start);
+  const dOpts = typeof cfg.discover === "object" ? cfg.discover : {};
+  const listed = new Set(cfg.collections.map((c) => c.address));
+  const known = () => cfg.discover ? discoverCollections(store, market, listed, cfg.marketStart, dOpts) : { all: [], added: [] };
+  for (const d of known().all) store.watch(d.address, d.start);
   let lastError = null, result = null;
-  try {
+  const cycleStart = Date.now();
+  const deadline = () => cycleStart + (cfg.syncBudgetMs ?? 15 * 6e4);
+  const sync = async () => {
     const source = cfg.source || "legacy";
     if (source === "receipts") {
       if (!isBlockSource(rpc)) throw new Error("SOURCE=receipts needs an RPC client that can read blocks and receipts");
       const r = await syncReceipts(rpc, store, { now, maxBlocks: cfg.maxBlocks });
       result = { finalized: r.finalized, newEvents: r.newEvents, ranges: r.blocks, complete: r.complete };
     } else if (source === "logs") {
-      const r = await syncLogs(rpc, store, { now, fallback: isBlockSource(rpc) ? rpc : null, log: (m) => console.log((/* @__PURE__ */ new Date()).toISOString(), m) });
+      const r = await syncLogs(rpc, store, { now, fallback: isBlockSource(rpc) ? rpc : null, log: (m) => console.log((/* @__PURE__ */ new Date()).toISOString(), m), deadline: deadline() });
       result = { finalized: r.finalized, newEvents: r.newEvents, ranges: r.ranges, complete: r.complete };
     } else {
       result = await syncOnce(rpc, store, { now });
     }
+  };
+  let discovered = [];
+  try {
+    await sync();
+    const k = known();
+    discovered = k.all;
+    if (k.added.length) {
+      for (const d of k.added) {
+        store.watch(d.address, d.start);
+        console.log((/* @__PURE__ */ new Date()).toISOString(), `discovered collection ${d.address} (first marketplace event at block ${d.firstSeen}); reading from block ${d.start}`);
+      }
+      await sync();
+    }
   } catch (e) {
     lastError = e instanceof Error ? e.message : String(e);
   }
-  const collections = new Set(cfg.collections.map((c) => c.address));
+  const all = [...cfg.collections, ...discovered.filter((d) => !listed.has(d.address)).map((d) => ({ address: d.address, start: d.start, complete: false }))];
+  const collections = new Set(all.map((c) => c.address));
   const log = (m) => console.log((/* @__PURE__ */ new Date()).toISOString(), m);
-  if (!lastError && cfg.verifyOwners !== false && canReadOwners(rpc)) {
+  if (!lastError && cfg.verifyOwners !== false && canReadOwners(rpc) && Date.now() < deadline()) {
     const at = store.meta().finalizedSeen ?? 0;
-    for (const c of cfg.collections) {
+    for (const c of all) {
+      if (Date.now() > deadline()) {
+        log("owners: out of time this cycle; checked again next cycle");
+        break;
+      }
       try {
         await verifyOwners(rpc, store, market, c.address, collections, at, { log });
       } catch (e) {
@@ -1011,7 +1299,8 @@ async function runCycle(rpc, store, cfg, now = Date.now) {
   }
   mkdirSync(cfg.outDir, { recursive: true });
   const cps = store.checkpoints(), meta = store.meta();
-  for (const c of cfg.collections) {
+  for (const c of all) {
+    if (!cps[c.address]) continue;
     const attributed = attributeEvents(store.events([market, c.address]), market, collections);
     const { fixes, mismatches } = corrections(attributed, c.address, store.verifiedOwners(c.address), cps[c.address].indexedTo);
     for (const m of mismatches) log(`owners: ${c.address.slice(0, 10)}\u2026 ${m} (chain value used)`);
@@ -1028,6 +1317,25 @@ async function runCycle(rpc, store, cfg, now = Date.now) {
     }, lastError);
     if (fixes.length) snap.activity = snap.activity.filter((a) => a.txHash !== SYNTHETIC_TX);
     writeAtomic(join(cfg.outDir, c.address + ".json"), JSON.stringify(snap));
+  }
+  writeAtomic(join(cfg.outDir, "collections.json"), JSON.stringify({
+    verified: cfg.collections.map((c) => c.address),
+    discovered: discovered.filter((d) => !listed.has(d.address)).map((d) => ({ address: d.address, firstSeen: d.firstSeen }))
+  }));
+  if (cfg.catalog) {
+    try {
+      let previous = null;
+      try {
+        const j = JSON.parse(readFileSync(join(cfg.outDir, "catalog.json"), "utf8"));
+        if (j && j.version === 1 && Array.isArray(j.collections)) previous = j;
+      } catch {
+      }
+      const cat = await buildCatalog({ market, collections: all.map((c) => ({ address: c.address, unverified: !listed.has(c.address) })), view: cfg.catalog.view, fetchText: cfg.catalog.fetchText, gateways: cfg.catalog.gateways, deadlineMs: cfg.catalog.deadlineMs, now, log, previous });
+      writeAtomic(join(cfg.outDir, "catalog.json"), JSON.stringify(cat));
+      log(`catalog: ${cat.collections.length} collections, ${cat.collections.reduce((n, c) => n + c.tokens.length, 0)} NFTs`);
+    } catch (e) {
+      log(`catalog: skipped: ${e instanceof Error ? e.message : e}`);
+    }
   }
   if (lastError) throw new Error(lastError);
   return result;
@@ -1048,14 +1356,18 @@ async function main() {
     dbPath: process.env.DB_PATH || "./data/indexer.sqlite",
     outDir: process.env.OUT_DIR || "./data/market",
     source: parseSource(process.env.SOURCE),
-    maxBlocks: Number(process.env.MAX_BLOCKS) || void 0
+    maxBlocks: Number(process.env.MAX_BLOCKS) || void 0,
+    discover: (process.env.DISCOVER || "").trim().toLowerCase() === "on",
+    syncBudgetMs: Number(process.env.SYNC_BUDGET_MS) || void 0
   };
   mkdirSync(join(cfg.dbPath, ".."), { recursive: true });
+  const catalogOn = (process.env.CATALOG || "on").trim().toLowerCase() !== "off";
   const store = new SqliteStore(cfg.dbPath);
   const url = process.env.ASENTUM_RPC || "https://testnet.asentum.com";
   const chain = new ChainRpc(url, { timeoutMs: Number(process.env.RPC_TIMEOUT_MS) || 35e3 });
   chain.onEvent = (m) => console.log((/* @__PURE__ */ new Date()).toISOString(), "note:", m);
   const rpc = cfg.source === "legacy" ? new HttpRpc(url) : chain;
+  if (catalogOn) cfg.catalog = { view: (c, m, a) => chain.view(c, m, a), fetchText: nodeFetchText, gateways: gatewaysFrom(process.env.IPFS_GATEWAYS), deadlineMs: Number(process.env.CATALOG_BUDGET_MS) || 12e4 };
   console.log((/* @__PURE__ */ new Date()).toISOString(), `indexer starting: source=${cfg.source}, rpc=${url}, db=${cfg.dbPath}`);
   const interval = Number(process.env.INTERVAL_MS || 1e4);
   let stopping = false;
@@ -1081,6 +1393,9 @@ async function main() {
 }
 if (process.argv[1] && /(^|[\\/])(worker\.ts|asentify-indexer\.mjs)$/.test(process.argv[1])) main();
 export {
+  DISCOVER_LOOKBACK,
+  DISCOVER_MAX,
+  discoverCollections,
   parseCollections,
   parseSource,
   runCycle,
