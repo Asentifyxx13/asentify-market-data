@@ -1,7 +1,7 @@
-// Asentify market-data indexer (bundled). Source: Asentifyxx13/asentify- (private), branch main, commit 8369a46. Reads the Asentum testnet only; sends no transactions; needs no keys.
+// Asentify market-data indexer (bundled). Source: Asentifyxx13/asentify- (private), branch main, commit 2a0bb08. Reads the Asentum testnet only; sends no transactions; needs no keys.
 
 // indexer/worker.ts
-import { mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 // src/lib/indexer/blake3.ts
@@ -1034,9 +1034,15 @@ async function buildCatalog(o) {
     const r = await o.view(c, m, a).catch(() => null);
     return r && r.ok ? r.value : void 0;
   };
-  for (const src of o.collections) {
+  const prev = /* @__PURE__ */ new Map();
+  for (const c of o.previous && Array.isArray(o.previous.collections) ? o.previous.collections : []) if (c && typeof c.address === "string") prev.set(c.address.toLowerCase(), c);
+  const n = o.collections.length, shift = n ? Math.floor(started / 36e5) % n : 0;
+  const order = o.collections.map((_, i) => o.collections[(i + shift) % n]);
+  let outOfTime = false;
+  for (const src of order) {
     if (now() > deadline) {
-      o.log?.("catalog: time budget reached, remaining collections left out");
+      if (!outOfTime) o.log?.("catalog: time budget reached; the rest keep their entry from the last catalog");
+      outOfTime = true;
       break;
     }
     let hex2;
@@ -1092,8 +1098,8 @@ async function buildCatalog(o) {
         }
         if (j) {
           stat.metaOk++;
-          const n = str(j.name, 200).trim();
-          if (n) t.name = n;
+          const n2 = str(j.name, 200).trim();
+          if (n2) t.name = n2;
           t.image = safeUri(j.image);
           t.preview = safeUri(j.image_preview);
           t.attributes = attrs(j.attributes);
@@ -1104,9 +1110,42 @@ async function buildCatalog(o) {
       }
       toks.set(id, t);
     });
-    col.tokens = take.map((id) => toks.get(id)).filter((t) => !!t);
+    const before = prev.get(hex2);
+    const old = new Map((before?.tokens ?? []).map((t) => [t.id, t]));
+    col.tokens = take.map((id) => toks.get(id) ?? (old.has(id) ? { ...old.get(id), ...listed.has(id) ? { price: listed.get(id).price, listingId: listed.get(id).listingId } : { price: void 0, listingId: void 0 } } : void 0)).filter((t) => !!t);
+    for (const t of col.tokens) {
+      if (t.price === void 0) delete t.price;
+      if (t.listingId === void 0) delete t.listingId;
+    }
+    if (!col.logo && before?.logo) col.logo = before.logo;
+    if (!col.banner && before?.banner) col.banner = before.banner;
     out.push(col);
   }
+  const have = new Set(out.map((c) => c.address));
+  let kept = 0;
+  for (const src of o.collections) {
+    let hex2;
+    try {
+      hex2 = toHexAddress(src.address).toLowerCase();
+    } catch {
+      continue;
+    }
+    const p = prev.get(hex2);
+    if (!have.has(hex2) && p) {
+      out.push({ ...p, unverified: src.unverified });
+      have.add(hex2);
+      kept++;
+    }
+  }
+  if (kept) o.log?.(`catalog: kept ${kept} collection(s) from the last catalog`);
+  const rank = new Map(o.collections.map((c, i) => {
+    try {
+      return [toHexAddress(c.address).toLowerCase(), i];
+    } catch {
+      return ["", i];
+    }
+  }));
+  out.sort((a, b) => (rank.get(a.address) ?? 1e9) - (rank.get(b.address) ?? 1e9));
   o.log?.(`catalog: metadata read for ${stat.metaOk} of ${stat.uris} NFTs with a tokenURI${stat.unreadable ? ` (${stat.unreadable} unreadable, e.g. ${stat.sample})` : ""}`);
   return { version: 1, generatedAt: now(), market: o.market, collections: out };
 }
@@ -1285,7 +1324,13 @@ async function runCycle(rpc, store, cfg, now = Date.now) {
   }));
   if (cfg.catalog) {
     try {
-      const cat = await buildCatalog({ market, collections: all.map((c) => ({ address: c.address, unverified: !listed.has(c.address) })), view: cfg.catalog.view, fetchText: cfg.catalog.fetchText, gateways: cfg.catalog.gateways, deadlineMs: cfg.catalog.deadlineMs, now, log });
+      let previous = null;
+      try {
+        const j = JSON.parse(readFileSync(join(cfg.outDir, "catalog.json"), "utf8"));
+        if (j && j.version === 1 && Array.isArray(j.collections)) previous = j;
+      } catch {
+      }
+      const cat = await buildCatalog({ market, collections: all.map((c) => ({ address: c.address, unverified: !listed.has(c.address) })), view: cfg.catalog.view, fetchText: cfg.catalog.fetchText, gateways: cfg.catalog.gateways, deadlineMs: cfg.catalog.deadlineMs, now, log, previous });
       writeAtomic(join(cfg.outDir, "catalog.json"), JSON.stringify(cat));
       log(`catalog: ${cat.collections.length} collections, ${cat.collections.reduce((n, c) => n + c.tokens.length, 0)} NFTs`);
     } catch (e) {
